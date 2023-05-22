@@ -2,14 +2,15 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build darwin dragonfly freebsd linux netbsd openbsd
+//go:build aix || darwin || dragonfly || freebsd || linux || netbsd || openbsd || solaris
+// +build aix darwin dragonfly freebsd linux netbsd openbsd solaris
 
 package test
 
 import (
 	"bytes"
+	"fmt"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	"net"
 	"testing"
@@ -31,17 +32,21 @@ func testPortForward(t *testing.T, n, listenAddr string) {
 		t.Fatal(err)
 	}
 
+	errCh := make(chan error, 1)
+
 	go func() {
+		defer close(errCh)
 		sshConn, err := sshListener.Accept()
 		if err != nil {
-			t.Fatalf("listen.Accept failed: %v", err)
+			errCh <- fmt.Errorf("listen.Accept failed: %v", err)
+			return
 		}
+		defer sshConn.Close()
 
 		_, err = io.Copy(sshConn, sshConn)
 		if err != nil && err != io.EOF {
-			t.Fatalf("ssh client copy: %v", err)
+			errCh <- fmt.Errorf("ssh client copy: %v", err)
 		}
-		sshConn.Close()
 	}()
 
 	forwardedAddr := sshListener.Addr().String()
@@ -52,7 +57,7 @@ func testPortForward(t *testing.T, n, listenAddr string) {
 
 	readChan := make(chan []byte)
 	go func() {
-		data, _ := ioutil.ReadAll(netConn)
+		data, _ := io.ReadAll(netConn)
 		readChan <- data
 	}()
 
@@ -74,6 +79,12 @@ func testPortForward(t *testing.T, n, listenAddr string) {
 	}
 	if err := netConn.(closeWriter).CloseWrite(); err != nil {
 		t.Errorf("netConn.CloseWrite: %v", err)
+	}
+
+	// Check for errors on server goroutine
+	err = <-errCh
+	if err != nil {
+		t.Fatalf("server: %v", err)
 	}
 
 	read := <-readChan

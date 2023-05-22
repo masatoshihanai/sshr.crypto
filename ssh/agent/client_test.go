@@ -13,8 +13,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
-	"sync"
+	"strings"
 	"testing"
 	"time"
 
@@ -35,17 +36,19 @@ func startOpenSSHAgent(t *testing.T) (client ExtendedAgent, socket string, clean
 	}
 
 	cmd := exec.Command(bin, "-s")
+	cmd.Env = []string{} // Do not let the user's environment influence ssh-agent behavior.
+	cmd.Stderr = new(bytes.Buffer)
 	out, err := cmd.Output()
 	if err != nil {
-		t.Fatalf("cmd.Output: %v", err)
+		t.Fatalf("%s failed: %v\n%s", strings.Join(cmd.Args, " "), err, cmd.Stderr)
 	}
 
-	/* Output looks like:
+	// Output looks like:
+	//
+	//	SSH_AUTH_SOCK=/tmp/ssh-P65gpcqArqvH/agent.15541; export SSH_AUTH_SOCK;
+	//	SSH_AGENT_PID=15542; export SSH_AGENT_PID;
+	//	echo Agent pid 15542;
 
-		   SSH_AUTH_SOCK=/tmp/ssh-P65gpcqArqvH/agent.15541; export SSH_AUTH_SOCK;
-	           SSH_AGENT_PID=15542; export SSH_AGENT_PID;
-	           echo Agent pid 15542;
-	*/
 	fields := bytes.Split(out, []byte(";"))
 	line := bytes.SplitN(fields[0], []byte("="), 2)
 	line[0] = bytes.TrimLeft(line[0], "\n")
@@ -179,9 +182,9 @@ func testAgentInterface(t *testing.T, agent ExtendedAgent, key interface{}, cert
 				t.Fatalf("Verify(%s): %v", pubKey.Type(), err)
 			}
 		}
-		sshFlagTest(0, ssh.SigAlgoRSA)
-		sshFlagTest(SignatureFlagRsaSha256, ssh.SigAlgoRSASHA2256)
-		sshFlagTest(SignatureFlagRsaSha512, ssh.SigAlgoRSASHA2512)
+		sshFlagTest(0, ssh.KeyAlgoRSA)
+		sshFlagTest(SignatureFlagRsaSha256, ssh.KeyAlgoRSASHA256)
+		sshFlagTest(SignatureFlagRsaSha512, ssh.KeyAlgoRSASHA512)
 	}
 
 	// If the key has a lifetime, is it removed when it should be?
@@ -200,44 +203,26 @@ func testAgentInterface(t *testing.T, agent ExtendedAgent, key interface{}, cert
 
 func TestMalformedRequests(t *testing.T) {
 	keyringAgent := NewKeyring()
-	listener, err := netListener()
-	if err != nil {
-		t.Fatalf("netListener: %v", err)
-	}
-	defer listener.Close()
 
 	testCase := func(t *testing.T, requestBytes []byte, wantServerErr bool) {
-		var wg sync.WaitGroup
-		wg.Add(1)
+		c, s := net.Pipe()
+		defer c.Close()
+		defer s.Close()
 		go func() {
-			defer wg.Done()
-			c, err := listener.Accept()
+			_, err := c.Write(requestBytes)
 			if err != nil {
-				t.Errorf("listener.Accept: %v", err)
-				return
+				t.Errorf("Unexpected error writing raw bytes on connection: %v", err)
 			}
-			defer c.Close()
-
-			err = ServeAgent(keyringAgent, c)
-			if err == nil {
-				t.Error("ServeAgent should have returned an error to malformed input")
-			} else {
-				if (err != io.EOF) != wantServerErr {
-					t.Errorf("ServeAgent returned expected error: %v", err)
-				}
-			}
+			c.Close()
 		}()
-
-		c, err := net.Dial("tcp", listener.Addr().String())
-		if err != nil {
-			t.Fatalf("net.Dial: %v", err)
+		err := ServeAgent(keyringAgent, s)
+		if err == nil {
+			t.Error("ServeAgent should have returned an error to malformed input")
+		} else {
+			if (err != io.EOF) != wantServerErr {
+				t.Errorf("ServeAgent returned expected error: %v", err)
+			}
 		}
-		_, err = c.Write(requestBytes)
-		if err != nil {
-			t.Errorf("Unexpected error writing raw bytes on connection: %v", err)
-		}
-		c.Close()
-		wg.Wait()
 	}
 
 	var testCases = []struct {
@@ -314,6 +299,8 @@ func TestServerResponseTooLarge(t *testing.T) {
 	if err != nil {
 		t.Fatalf("netPipe: %v", err)
 	}
+	done := make(chan struct{})
+	defer func() { <-done }()
 
 	defer a.Close()
 	defer b.Close()
@@ -324,9 +311,21 @@ func TestServerResponseTooLarge(t *testing.T) {
 
 	agent := NewClient(a)
 	go func() {
-		n, _ := b.Write(ssh.Marshal(response))
+		defer close(done)
+		n, err := b.Write(ssh.Marshal(response))
 		if n < 4 {
-			t.Fatalf("At least 4 bytes (the response size) should have been successfully written: %d < 4", n)
+			if runtime.GOOS == "plan9" {
+				if e1, ok := err.(*net.OpError); ok {
+					if e2, ok := e1.Err.(*os.PathError); ok {
+						switch e2.Err.Error() {
+						case "Hangup", "i/o on hungup channel":
+							// syscall.Pwrite returns -1 in this case even when some data did get written.
+							return
+						}
+					}
+				}
+			}
+			t.Errorf("At least 4 bytes (the response size) should have been successfully written: %d < 4: %v", n, err)
 		}
 	}()
 	_, err = agent.List()

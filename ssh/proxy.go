@@ -5,13 +5,13 @@
 package ssh
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"net"
-	"bytes"
 	"os"
 	"path"
-	"io/ioutil"
 )
 
 type userFile string
@@ -25,19 +25,19 @@ type AuthType int
 
 type ProxyConfig struct {
 	Config
-	ServerConfig        *ServerConfig
-	ClientConfig        *ClientConfig
-	DestinationPort     string
+	ServerConfig    *ServerConfig
+	ClientConfig    *ClientConfig
+	DestinationPort string
 	// Specify upstream host by SSH username
-	FindUpstreamHook    func(username string) (string, error)
+	FindUpstreamHook func(username string) (string, error)
 	// Fetch authorized_keys to confirm registration of the client's public key.
 	FetchAuthorizedKeysHook func(username string, host string) ([]byte, error)
 	// Fetch the private key used when sshr performs public key authentication as a client user
 	// to the upstream host
 	FetchPrivateKeyHook func(username string) ([]byte, error)
 	// When using only the master key when sending requests to the upstream server, set A to true.
-	UseMasterKey        bool
-	MasterKeyPath       string
+	UseMasterKey  bool
+	MasterKeyPath string
 }
 
 type ProxyConn struct {
@@ -161,7 +161,7 @@ func fetchPrivateKey(proxyConf *ProxyConfig, username string) ([]byte, error) {
 			return nil, err
 		}
 	} else if proxyConf.FetchPrivateKeyHook == nil {
-		privateBytes, err =  fetchPrivateKeyFromHomeDir(username)
+		privateBytes, err = fetchPrivateKeyFromHomeDir(username)
 		if err != nil {
 			return nil, err
 		}
@@ -208,7 +208,7 @@ func userSpecFile(username, file string) string {
 }
 
 func (p *ProxyConn) sendOKMsg(key PublicKey) error {
-	okMsg := userAuthPubKeyOkMsg {
+	okMsg := userAuthPubKeyOkMsg{
 		Algo:   key.Type(),
 		PubKey: key.Marshal(),
 	}
@@ -241,9 +241,9 @@ func (p *ProxyConn) VerifySignature(msg *userAuthRequestMsg, publicKey PublicKey
 }
 
 func (p *ProxyConn) signAgain(user string, msg *userAuthRequestMsg, signer Signer) (*userAuthRequestMsg, error) {
-	rand                  := p.Upstream.transport.config.Rand
-	sessionID             := p.Upstream.transport.getSessionID()
-	upStreamPublicKey     := signer.PublicKey()
+	rand := p.Upstream.transport.config.Rand
+	sessionID := p.Upstream.transport.getSessionID()
+	upStreamPublicKey := signer.PublicKey()
 	upStreamPublicKeyData := upStreamPublicKey.Marshal()
 
 	sign, err := signer.Sign(rand, buildDataSignedForAuth(sessionID, userAuthRequestMsg{
@@ -291,8 +291,21 @@ func (p *ProxyConn) Wait() error {
 }
 
 func (p *ProxyConn) Close() {
-	p.Upstream.transport.Close()
-	p.Downstream.transport.Close()
+	if p.Upstream != nil {
+		if p.Upstream.transport != nil {
+			p.Upstream.transport.Close()
+		}
+
+		p.Upstream.Close()
+
+	}
+	if p.Downstream != nil {
+		if p.Downstream.transport != nil {
+			p.Downstream.transport.Close()
+		}
+
+		p.Downstream.Close()
+	}
 }
 
 func (p *ProxyConn) checkBridgeAuthWithNoBanner(packet []byte) (bool, error) {

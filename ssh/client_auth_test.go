@@ -10,7 +10,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
+	"net"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -31,12 +34,19 @@ var clientPassword = "tiger"
 // tryAuth runs a handshake with a given config against an SSH server
 // with config serverConfig. Returns both client and server side errors.
 func tryAuth(t *testing.T, config *ClientConfig) error {
-	err, _ := tryAuthBothSides(t, config)
+	err, _ := tryAuthBothSides(t, config, nil)
+	return err
+}
+
+// tryAuth runs a handshake with a given config against an SSH server
+// with a given GSSAPIWithMICConfig and config serverConfig. Returns both client and server side errors.
+func tryAuthWithGSSAPIWithMICConfig(t *testing.T, clientConfig *ClientConfig, gssAPIWithMICConfig *GSSAPIWithMICConfig) error {
+	err, _ := tryAuthBothSides(t, clientConfig, gssAPIWithMICConfig)
 	return err
 }
 
 // tryAuthBothSides runs the handshake and returns the resulting errors from both sides of the connection.
-func tryAuthBothSides(t *testing.T, config *ClientConfig) (clientError error, serverAuthErrors []error) {
+func tryAuthBothSides(t *testing.T, config *ClientConfig, gssAPIWithMICConfig *GSSAPIWithMICConfig) (clientError error, serverAuthErrors []error) {
 	c1, c2, err := netPipe()
 	if err != nil {
 		t.Fatalf("netPipe: %v", err)
@@ -59,7 +69,6 @@ func tryAuthBothSides(t *testing.T, config *ClientConfig) (clientError error, se
 			return c.Serial == 666
 		},
 	}
-
 	serverConfig := &ServerConfig{
 		PasswordCallback: func(conn ConnMetadata, pass []byte) (*Permissions, error) {
 			if conn.User() == "testuser" && string(pass) == clientPassword {
@@ -83,6 +92,7 @@ func tryAuthBothSides(t *testing.T, config *ClientConfig) (clientError error, se
 			}
 			return nil, errors.New("keyboard-interactive failed")
 		},
+		GSSAPIWithMICConfig: gssAPIWithMICConfig,
 	}
 	serverConfig.AddHostKey(testSigners["rsa"])
 
@@ -95,11 +105,61 @@ func tryAuthBothSides(t *testing.T, config *ClientConfig) (clientError error, se
 	return err, serverAuthErrors
 }
 
+type loggingAlgorithmSigner struct {
+	used []string
+	AlgorithmSigner
+}
+
+func (l *loggingAlgorithmSigner) Sign(rand io.Reader, data []byte) (*Signature, error) {
+	l.used = append(l.used, "[Sign]")
+	return l.AlgorithmSigner.Sign(rand, data)
+}
+
+func (l *loggingAlgorithmSigner) SignWithAlgorithm(rand io.Reader, data []byte, algorithm string) (*Signature, error) {
+	l.used = append(l.used, algorithm)
+	return l.AlgorithmSigner.SignWithAlgorithm(rand, data, algorithm)
+}
+
 func TestClientAuthPublicKey(t *testing.T) {
+	signer := &loggingAlgorithmSigner{AlgorithmSigner: testSigners["rsa"].(AlgorithmSigner)}
 	config := &ClientConfig{
 		User: "testuser",
 		Auth: []AuthMethod{
-			PublicKeys(testSigners["rsa"]),
+			PublicKeys(signer),
+		},
+		HostKeyCallback: InsecureIgnoreHostKey(),
+	}
+	if err := tryAuth(t, config); err != nil {
+		t.Fatalf("unable to dial remote side: %s", err)
+	}
+	if len(signer.used) != 1 || signer.used[0] != KeyAlgoRSASHA256 {
+		t.Errorf("unexpected Sign/SignWithAlgorithm calls: %q", signer.used)
+	}
+}
+
+// TestClientAuthNoSHA2 tests a ssh-rsa Signer that doesn't implement AlgorithmSigner.
+func TestClientAuthNoSHA2(t *testing.T) {
+	config := &ClientConfig{
+		User: "testuser",
+		Auth: []AuthMethod{
+			PublicKeys(&legacyRSASigner{testSigners["rsa"]}),
+		},
+		HostKeyCallback: InsecureIgnoreHostKey(),
+	}
+	if err := tryAuth(t, config); err != nil {
+		t.Fatalf("unable to dial remote side: %s", err)
+	}
+}
+
+// TestClientAuthThirdKey checks that the third configured can succeed. If we
+// were to do three attempts for each key (rsa-sha2-256, rsa-sha2-512, ssh-rsa),
+// we'd hit the six maximum attempts before reaching it.
+func TestClientAuthThirdKey(t *testing.T) {
+	config := &ClientConfig{
+		User: "testuser",
+		Auth: []AuthMethod{
+			PublicKeys(testSigners["rsa-openssh-format"],
+				testSigners["rsa-openssh-format"], testSigners["rsa"]),
 		},
 		HostKeyCallback: InsecureIgnoreHostKey(),
 	}
@@ -245,7 +305,7 @@ func TestMethodInvalidAlgorithm(t *testing.T) {
 		HostKeyCallback: InsecureIgnoreHostKey(),
 	}
 
-	err, serverErrors := tryAuthBothSides(t, config)
+	err, serverErrors := tryAuthBothSides(t, config, nil)
 	if err == nil {
 		t.Fatalf("login succeeded")
 	}
@@ -307,7 +367,7 @@ func TestClientUnsupportedKex(t *testing.T) {
 			PublicKeys(),
 		},
 		Config: Config{
-			KeyExchanges: []string{"diffie-hellman-group-exchange-sha256"}, // not currently supported
+			KeyExchanges: []string{"non-existent-kex"},
 		},
 		HostKeyCallback: InsecureIgnoreHostKey(),
 	}
@@ -477,7 +537,7 @@ func TestRetryableAuth(t *testing.T) {
 	}
 }
 
-func ExampleRetryableAuthMethod(t *testing.T) {
+func ExampleRetryableAuthMethod() {
 	user := "testuser"
 	NumberOfPrompts := 3
 
@@ -495,9 +555,17 @@ func ExampleRetryableAuthMethod(t *testing.T) {
 		},
 	}
 
-	if err := tryAuth(t, config); err != nil {
-		t.Fatalf("unable to dial remote side: %s", err)
+	host := "mysshserver"
+	netConn, err := net.Dial("tcp", host)
+	if err != nil {
+		log.Fatal(err)
 	}
+
+	sshConn, _, _, err := NewClientConn(netConn, host, config)
+	if err != nil {
+		log.Fatal(err)
+	}
+	_ = sshConn
 }
 
 // Test if username is received on server side when NoClientAuth is used
@@ -622,7 +690,15 @@ func TestClientAuthMaxAuthTriesPublicKey(t *testing.T) {
 	if err := tryAuth(t, invalidConfig); err == nil {
 		t.Fatalf("client: got no error, want %s", expectedErr)
 	} else if err.Error() != expectedErr.Error() {
-		t.Fatalf("client: got %s, want %s", err, expectedErr)
+		// On Windows we can see a WSAECONNABORTED error
+		// if the client writes another authentication request
+		// before the client goroutine reads the disconnection
+		// message.  See issue 50805.
+		if runtime.GOOS == "windows" && strings.Contains(err.Error(), "wsarecv: An established connection was aborted") {
+			// OK.
+		} else {
+			t.Fatalf("client: got %s, want %s", err, expectedErr)
+		}
 	}
 }
 
@@ -673,6 +749,209 @@ func TestClientAuthErrorList(t *testing.T) {
 			}
 		default:
 			t.Fatalf("errors: got %v, expected 2 errors", authErrs.Errors)
+		}
+	}
+}
+
+func TestAuthMethodGSSAPIWithMIC(t *testing.T) {
+	type testcase struct {
+		config        *ClientConfig
+		gssConfig     *GSSAPIWithMICConfig
+		clientWantErr string
+		serverWantErr string
+	}
+	testcases := []*testcase{
+		{
+			config: &ClientConfig{
+				User: "testuser",
+				Auth: []AuthMethod{
+					GSSAPIWithMICAuthMethod(
+						&FakeClient{
+							exchanges: []*exchange{
+								{
+									outToken: "client-valid-token-1",
+								},
+								{
+									expectedToken: "server-valid-token-1",
+								},
+							},
+							mic:      []byte("valid-mic"),
+							maxRound: 2,
+						}, "testtarget",
+					),
+				},
+				HostKeyCallback: InsecureIgnoreHostKey(),
+			},
+			gssConfig: &GSSAPIWithMICConfig{
+				AllowLogin: func(conn ConnMetadata, srcName string) (*Permissions, error) {
+					if srcName != conn.User()+"@DOMAIN" {
+						return nil, fmt.Errorf("srcName is %s, conn user is %s", srcName, conn.User())
+					}
+					return nil, nil
+				},
+				Server: &FakeServer{
+					exchanges: []*exchange{
+						{
+							outToken:      "server-valid-token-1",
+							expectedToken: "client-valid-token-1",
+						},
+					},
+					maxRound:    1,
+					expectedMIC: []byte("valid-mic"),
+					srcName:     "testuser@DOMAIN",
+				},
+			},
+		},
+		{
+			config: &ClientConfig{
+				User: "testuser",
+				Auth: []AuthMethod{
+					GSSAPIWithMICAuthMethod(
+						&FakeClient{
+							exchanges: []*exchange{
+								{
+									outToken: "client-valid-token-1",
+								},
+								{
+									expectedToken: "server-valid-token-1",
+								},
+							},
+							mic:      []byte("valid-mic"),
+							maxRound: 2,
+						}, "testtarget",
+					),
+				},
+				HostKeyCallback: InsecureIgnoreHostKey(),
+			},
+			gssConfig: &GSSAPIWithMICConfig{
+				AllowLogin: func(conn ConnMetadata, srcName string) (*Permissions, error) {
+					return nil, fmt.Errorf("user is not allowed to login")
+				},
+				Server: &FakeServer{
+					exchanges: []*exchange{
+						{
+							outToken:      "server-valid-token-1",
+							expectedToken: "client-valid-token-1",
+						},
+					},
+					maxRound:    1,
+					expectedMIC: []byte("valid-mic"),
+					srcName:     "testuser@DOMAIN",
+				},
+			},
+			serverWantErr: "user is not allowed to login",
+			clientWantErr: "ssh: handshake failed: ssh: unable to authenticate",
+		},
+		{
+			config: &ClientConfig{
+				User: "testuser",
+				Auth: []AuthMethod{
+					GSSAPIWithMICAuthMethod(
+						&FakeClient{
+							exchanges: []*exchange{
+								{
+									outToken: "client-valid-token-1",
+								},
+								{
+									expectedToken: "server-valid-token-1",
+								},
+							},
+							mic:      []byte("valid-mic"),
+							maxRound: 2,
+						}, "testtarget",
+					),
+				},
+				HostKeyCallback: InsecureIgnoreHostKey(),
+			},
+			gssConfig: &GSSAPIWithMICConfig{
+				AllowLogin: func(conn ConnMetadata, srcName string) (*Permissions, error) {
+					if srcName != conn.User() {
+						return nil, fmt.Errorf("srcName is %s, conn user is %s", srcName, conn.User())
+					}
+					return nil, nil
+				},
+				Server: &FakeServer{
+					exchanges: []*exchange{
+						{
+							outToken:      "server-invalid-token-1",
+							expectedToken: "client-valid-token-1",
+						},
+					},
+					maxRound:    1,
+					expectedMIC: []byte("valid-mic"),
+					srcName:     "testuser@DOMAIN",
+				},
+			},
+			clientWantErr: "ssh: handshake failed: got \"server-invalid-token-1\", want token \"server-valid-token-1\"",
+		},
+		{
+			config: &ClientConfig{
+				User: "testuser",
+				Auth: []AuthMethod{
+					GSSAPIWithMICAuthMethod(
+						&FakeClient{
+							exchanges: []*exchange{
+								{
+									outToken: "client-valid-token-1",
+								},
+								{
+									expectedToken: "server-valid-token-1",
+								},
+							},
+							mic:      []byte("invalid-mic"),
+							maxRound: 2,
+						}, "testtarget",
+					),
+				},
+				HostKeyCallback: InsecureIgnoreHostKey(),
+			},
+			gssConfig: &GSSAPIWithMICConfig{
+				AllowLogin: func(conn ConnMetadata, srcName string) (*Permissions, error) {
+					if srcName != conn.User() {
+						return nil, fmt.Errorf("srcName is %s, conn user is %s", srcName, conn.User())
+					}
+					return nil, nil
+				},
+				Server: &FakeServer{
+					exchanges: []*exchange{
+						{
+							outToken:      "server-valid-token-1",
+							expectedToken: "client-valid-token-1",
+						},
+					},
+					maxRound:    1,
+					expectedMIC: []byte("valid-mic"),
+					srcName:     "testuser@DOMAIN",
+				},
+			},
+			serverWantErr: "got MICToken \"invalid-mic\", want \"valid-mic\"",
+			clientWantErr: "ssh: handshake failed: ssh: unable to authenticate",
+		},
+	}
+
+	for i, c := range testcases {
+		clientErr, serverErrs := tryAuthBothSides(t, c.config, c.gssConfig)
+		if (c.clientWantErr == "") != (clientErr == nil) {
+			t.Fatalf("client got %v, want %s, case %d", clientErr, c.clientWantErr, i)
+		}
+		if (c.serverWantErr == "") != (len(serverErrs) == 2 && serverErrs[1] == nil || len(serverErrs) == 1) {
+			t.Fatalf("server got err %v, want %s", serverErrs, c.serverWantErr)
+		}
+		if c.clientWantErr != "" {
+			if clientErr != nil && !strings.Contains(clientErr.Error(), c.clientWantErr) {
+				t.Fatalf("client  got %v, want %s, case %d", clientErr, c.clientWantErr, i)
+			}
+		}
+		found := false
+		var errStrings []string
+		if c.serverWantErr != "" {
+			for _, err := range serverErrs {
+				found = found || (err != nil && strings.Contains(err.Error(), c.serverWantErr))
+				errStrings = append(errStrings, err.Error())
+			}
+			if !found {
+				t.Errorf("server got error %q, want substring %q, case %d", errStrings, c.serverWantErr, i)
+			}
 		}
 	}
 }
