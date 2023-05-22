@@ -11,7 +11,6 @@ import (
 	crypto_rand "crypto/rand"
 	"errors"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	"net"
 	"testing"
@@ -35,7 +34,7 @@ func dial(handler serverType, t *testing.T) *Client {
 		}
 		conf.AddHostKey(testSigners["rsa"])
 
-		_, chans, reqs, err := NewServerConn(c1, &conf)
+		conn, chans, reqs, err := NewServerConn(c1, &conf)
 		if err != nil {
 			t.Fatalf("Unable to handshake: %v", err)
 		}
@@ -55,6 +54,9 @@ func dial(handler serverType, t *testing.T) *Client {
 			go func() {
 				handler(ch, inReqs, t)
 			}()
+		}
+		if err := conn.Wait(); err != io.EOF {
+			t.Logf("server exit reason: %v", err)
 		}
 	}()
 
@@ -358,10 +360,9 @@ func TestServerWindow(t *testing.T) {
 	}
 	written, err := copyNRandomly("stdin", serverStdin, origBuf, windowTestBytes)
 	if err != nil {
-		t.Fatalf("failed to copy origBuf to serverStdin: %v", err)
-	}
-	if written != windowTestBytes {
-		t.Fatalf("Wrote only %d of %d bytes to server", written, windowTestBytes)
+		t.Errorf("failed to copy origBuf to serverStdin: %v", err)
+	} else if written != windowTestBytes {
+		t.Errorf("Wrote only %d of %d bytes to server", written, windowTestBytes)
 	}
 
 	echoedBytes := <-result
@@ -529,7 +530,7 @@ func sendSignal(signal string, ch Channel, t *testing.T) {
 
 func discardHandler(ch Channel, t *testing.T) {
 	defer ch.Close()
-	io.Copy(ioutil.Discard, ch)
+	io.Copy(io.Discard, ch)
 }
 
 func echoHandler(ch Channel, in <-chan *Request, t *testing.T) {
@@ -604,7 +605,7 @@ func TestClientWriteEOF(t *testing.T) {
 	}
 	stdin.Close()
 
-	res, err := ioutil.ReadAll(stdout)
+	res, err := io.ReadAll(stdout)
 	if err != nil {
 		t.Fatalf("Read failed: %v", err)
 	}
@@ -616,7 +617,7 @@ func TestClientWriteEOF(t *testing.T) {
 
 func simpleEchoHandler(ch Channel, in <-chan *Request, t *testing.T) {
 	defer ch.Close()
-	data, err := ioutil.ReadAll(ch)
+	data, err := io.ReadAll(ch)
 	if err != nil {
 		t.Errorf("handler read error: %v", err)
 	}
@@ -758,6 +759,12 @@ func TestHostKeyAlgorithms(t *testing.T) {
 	clientConf.HostKeyAlgorithms = []string{KeyAlgoRSA}
 	connect(clientConf, KeyAlgoRSA)
 
+	// Client asks for RSA-SHA2-512 explicitly.
+	clientConf.HostKeyAlgorithms = []string{KeyAlgoRSASHA512}
+	// We get back an "ssh-rsa" key but the verification happened
+	// with an RSA-SHA2-512 signature.
+	connect(clientConf, KeyAlgoRSA)
+
 	c1, c2, err := netPipe()
 	if err != nil {
 		t.Fatalf("netPipe: %v", err)
@@ -770,5 +777,56 @@ func TestHostKeyAlgorithms(t *testing.T) {
 	_, _, _, err = NewClientConn(c2, "", clientConf)
 	if err == nil {
 		t.Fatal("succeeded connecting with unknown hostkey algorithm")
+	}
+}
+
+func TestServerClientAuthCallback(t *testing.T) {
+	c1, c2, err := netPipe()
+	if err != nil {
+		t.Fatalf("netPipe: %v", err)
+	}
+	defer c1.Close()
+	defer c2.Close()
+
+	userCh := make(chan string, 1)
+
+	serverConf := &ServerConfig{
+		NoClientAuth: true,
+		NoClientAuthCallback: func(conn ConnMetadata) (*Permissions, error) {
+			userCh <- conn.User()
+			return nil, nil
+		},
+	}
+	const someUsername = "some-username"
+
+	serverConf.AddHostKey(testSigners["ecdsa"])
+	clientConf := &ClientConfig{
+		HostKeyCallback: InsecureIgnoreHostKey(),
+		User:            someUsername,
+	}
+
+	go func() {
+		_, chans, reqs, err := NewServerConn(c1, serverConf)
+		if err != nil {
+			t.Errorf("server handshake: %v", err)
+			userCh <- "error"
+			return
+		}
+		go DiscardRequests(reqs)
+		for ch := range chans {
+			ch.Reject(Prohibited, "")
+		}
+	}()
+
+	conn, _, _, err := NewClientConn(c2, "", clientConf)
+	if err != nil {
+		t.Fatalf("client handshake: %v", err)
+		return
+	}
+	conn.Close()
+
+	got := <-userCh
+	if got != someUsername {
+		t.Errorf("username = %q; want %q", got, someUsername)
 	}
 }
