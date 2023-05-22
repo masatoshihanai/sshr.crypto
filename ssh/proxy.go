@@ -228,10 +228,10 @@ func (file userFile) read(username string) ([]byte, error) {
 }
 
 func (p *ProxyConn) VerifySignature(msg *userAuthRequestMsg, publicKey PublicKey, sig *Signature) (bool, error) {
-	if !isAcceptableAlgo(sig.Format) {
+	if !contains(supportedPubKeyAuthAlgos, sig.Format) {
 		return false, fmt.Errorf("ssh: algorithm %q not accepted", sig.Format)
 	}
-	signedData := buildDataSignedForAuth(p.Downstream.transport.getSessionID(), *msg, []byte(publicKey.Type()), publicKey.Marshal())
+	signedData := buildDataSignedForAuth(p.Downstream.transport.getSessionID(), *msg, publicKey.Type(), publicKey.Marshal())
 
 	if err := publicKey.Verify(signedData, sig); err != nil {
 		return false, nil
@@ -250,7 +250,7 @@ func (p *ProxyConn) signAgain(user string, msg *userAuthRequestMsg, signer Signe
 		User:    user,
 		Service: serviceSSH,
 		Method:  "publickey",
-	}, []byte(upStreamPublicKey.Type()), upStreamPublicKeyData))
+	}, upStreamPublicKey.Type(), upStreamPublicKeyData))
 	if err != nil {
 		return nil, err
 	}
@@ -403,7 +403,7 @@ func parsePublicKeyMsg(userAuthReq *userAuthRequestMsg) (PublicKey, bool, *Signa
 		return nil, false, nil, parseError(msgUserAuthRequest)
 	}
 	algo := string(algoBytes)
-	if !isAcceptableAlgo(algo) {
+	if !contains(supportedPubKeyAuthAlgos, underlyingAlgo(algo)) {
 		return nil, false, nil, fmt.Errorf("ssh: algorithm %q not accepted", algo)
 	}
 
