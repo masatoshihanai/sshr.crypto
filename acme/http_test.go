@@ -7,7 +7,7 @@ package acme
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -54,7 +54,7 @@ func TestErrorResponse(t *testing.T) {
 	res := &http.Response{
 		StatusCode: 400,
 		Status:     "400 Bad Request",
-		Body:       ioutil.NopCloser(strings.NewReader(s)),
+		Body:       io.NopCloser(strings.NewReader(s)),
 		Header:     http.Header{"X-Foo": {"bar"}},
 	}
 	err := responseError(res)
@@ -87,7 +87,7 @@ func TestPostWithRetries(t *testing.T) {
 			return
 		}
 
-		head, err := decodeJWSHead(r)
+		head, err := decodeJWSHead(r.Body)
 		switch {
 		case err != nil:
 			t.Errorf("decodeJWSHead: %v", err)
@@ -115,8 +115,8 @@ func TestPostWithRetries(t *testing.T) {
 	if _, err := client.Authorize(context.Background(), "example.com"); err != nil {
 		t.Errorf("client.Authorize 1: %v", err)
 	}
-	if count != 4 {
-		t.Errorf("total requests count: %d; want 4", count)
+	if count != 3 {
+		t.Errorf("total requests count: %d; want 3", count)
 	}
 }
 
@@ -209,5 +209,47 @@ func TestRetryBackoffArgs(t *testing.T) {
 	}
 	if nretry != 3 {
 		t.Errorf("nretry = %d; want 3", nretry)
+	}
+}
+
+func TestUserAgent(t *testing.T) {
+	for _, custom := range []string{"", "CUSTOM_UA"} {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			t.Log(r.UserAgent())
+			if s := "golang.org/x/crypto/acme"; !strings.Contains(r.UserAgent(), s) {
+				t.Errorf("expected User-Agent to contain %q, got %q", s, r.UserAgent())
+			}
+			if !strings.Contains(r.UserAgent(), custom) {
+				t.Errorf("expected User-Agent to contain %q, got %q", custom, r.UserAgent())
+			}
+
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"newOrder": "sure"}`))
+		}))
+		defer ts.Close()
+
+		client := &Client{
+			Key:          testKey,
+			DirectoryURL: ts.URL,
+			UserAgent:    custom,
+		}
+		if _, err := client.Discover(context.Background()); err != nil {
+			t.Errorf("client.Discover: %v", err)
+		}
+	}
+}
+
+func TestAccountKidLoop(t *testing.T) {
+	// if Client.postNoRetry is called with a nil key argument
+	// then Client.Key must be set, otherwise we fall into an
+	// infinite loop (which also causes a deadlock).
+	client := &Client{dir: &Directory{OrderURL: ":)"}}
+	_, _, err := client.postNoRetry(context.Background(), nil, "", nil)
+	if err == nil {
+		t.Fatal("Client.postNoRetry didn't fail with a nil key")
+	}
+	expected := "acme: Client.Key must be populated to make POST requests"
+	if err.Error() != expected {
+		t.Fatalf("Unexpected error returned: wanted %q, got %q", expected, err.Error())
 	}
 }

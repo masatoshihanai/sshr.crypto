@@ -2,7 +2,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build !windows,!solaris,!aix
+//go:build !windows && !js && !wasip1
+// +build !windows,!js,!wasip1
 
 package test
 
@@ -11,7 +12,6 @@ package test
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"strings"
 	"testing"
@@ -54,7 +54,7 @@ func testDial(t *testing.T, n, listenAddr string, x dialTester) {
 	}
 	x.TestClientConn(t, conn)
 	defer conn.Close()
-	b, err := ioutil.ReadAll(conn)
+	b, err := io.ReadAll(conn)
 	if err != nil {
 		t.Fatalf("ReadAll: %v", err)
 	}
@@ -104,8 +104,8 @@ func (x *unixDialTester) TestServerConn(t *testing.T, c net.Conn) {
 	if c.LocalAddr().String() != x.listenAddr {
 		t.Fatalf("expected %q, got %q", x.listenAddr, c.LocalAddr().String())
 	}
-	if c.RemoteAddr().String() != "@" {
-		t.Fatalf("expected \"@\", got %q", c.RemoteAddr().String())
+	if c.RemoteAddr().String() != "@" && c.RemoteAddr().String() != "" {
+		t.Fatalf("expected \"@\" or \"\", got %q", c.RemoteAddr().String())
 	}
 }
 
