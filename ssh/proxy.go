@@ -55,7 +55,7 @@ func (p *ProxyConn) handleAuthMsg(msg *userAuthRequestMsg, proxyConf *ProxyConfi
 			proxyConf.FetchAuthorizedKeysHook = fetchAuthorizedKeysFromHomeDir
 		}
 
-		downStreamPublicKey, isQuery, sig, err := parsePublicKeyMsg(msg)
+		downStreamPublicKey, isQuery, sig, algo, err := parsePublicKeyMsg(msg)
 		if err != nil {
 			break
 		}
@@ -77,7 +77,7 @@ func (p *ProxyConn) handleAuthMsg(msg *userAuthRequestMsg, proxyConf *ProxyConfi
 			return noneAuthMsg(username), nil
 		}
 
-		ok, err = p.VerifySignature(msg, downStreamPublicKey, sig)
+		ok, err = p.VerifySignature(msg, downStreamPublicKey, algo, sig)
 		if err != nil || !ok {
 			break
 		}
@@ -105,10 +105,9 @@ func (p *ProxyConn) handleAuthMsg(msg *userAuthRequestMsg, proxyConf *ProxyConfi
 
 		for _, signer := range signers {
 			msg, err = p.signAgain(username, msg, signer)
-			if err != nil {
-				break
+			if err == nil {
+				return msg, nil
 			}
-			return msg, nil
 		}
 
 	case "password":
@@ -121,7 +120,7 @@ func (p *ProxyConn) handleAuthMsg(msg *userAuthRequestMsg, proxyConf *ProxyConfi
 		return msg, nil
 	}
 
-	err := p.sendFailureMsg(msg.Method)
+	err := p.SendFailureMsg(msg.Method)
 	return nil, err
 }
 
@@ -216,7 +215,7 @@ func (p *ProxyConn) sendOKMsg(key PublicKey) error {
 	return p.Downstream.transport.writePacket(Marshal(&okMsg))
 }
 
-func (p *ProxyConn) sendFailureMsg(method string) error {
+func (p *ProxyConn) SendFailureMsg(method string) error {
 	var failureMsg userAuthFailureMsg
 	failureMsg.Methods = append(failureMsg.Methods, method)
 
@@ -227,11 +226,11 @@ func (file userFile) read(username string) ([]byte, error) {
 	return ioutil.ReadFile(userSpecFile(username, string(file)))
 }
 
-func (p *ProxyConn) VerifySignature(msg *userAuthRequestMsg, publicKey PublicKey, sig *Signature) (bool, error) {
+func (p *ProxyConn) VerifySignature(msg *userAuthRequestMsg, publicKey PublicKey, algo string, sig *Signature) (bool, error) {
 	if !contains(supportedPubKeyAuthAlgos, sig.Format) {
 		return false, fmt.Errorf("ssh: algorithm %q not accepted", sig.Format)
 	}
-	signedData := buildDataSignedForAuth(p.Downstream.transport.getSessionID(), *msg, publicKey.Type(), publicKey.Marshal())
+	signedData := buildDataSignedForAuth(p.Downstream.transport.getSessionID(), *msg, algo, publicKey.Marshal())
 
 	if err := publicKey.Verify(signedData, sig); err != nil {
 		return false, nil
@@ -387,45 +386,45 @@ func (p *ProxyConn) AuthenticateProxyConn(initUserAuthMsg *userAuthRequestMsg, p
 	}
 }
 
-func parsePublicKeyMsg(userAuthReq *userAuthRequestMsg) (PublicKey, bool, *Signature, error) {
+func parsePublicKeyMsg(userAuthReq *userAuthRequestMsg) (PublicKey, bool, *Signature, string, error) {
 	if userAuthReq.Method != "publickey" {
-		return nil, false, nil, fmt.Errorf("not a publickey auth msg")
+		return nil, false, nil, "", fmt.Errorf("not a publickey auth msg")
 	}
 
 	payload := userAuthReq.Payload
 	if len(payload) < 1 {
-		return nil, false, nil, parseError(msgUserAuthRequest)
+		return nil, false, nil, "", parseError(msgUserAuthRequest)
 	}
 	isQuery := payload[0] == 0
 	payload = payload[1:]
 	algoBytes, payload, ok := parseString(payload)
 	if !ok {
-		return nil, false, nil, parseError(msgUserAuthRequest)
+		return nil, false, nil, "", parseError(msgUserAuthRequest)
 	}
 	algo := string(algoBytes)
 	if !contains(supportedPubKeyAuthAlgos, underlyingAlgo(algo)) {
-		return nil, false, nil, fmt.Errorf("ssh: algorithm %q not accepted", algo)
+		return nil, false, nil, "", fmt.Errorf("ssh: algorithm %q not accepted", algo)
 	}
 
 	pubKeyData, payload, ok := parseString(payload)
 	if !ok {
-		return nil, false, nil, parseError(msgUserAuthRequest)
+		return nil, false, nil, "", parseError(msgUserAuthRequest)
 	}
 
 	publicKey, err := ParsePublicKey(pubKeyData)
 	if err != nil {
-		return nil, false, nil, err
+		return nil, false, nil, "", err
 	}
 
 	var sig *Signature
 	if !isQuery {
 		sig, payload, ok = parseSignature(payload)
 		if !ok || len(payload) > 0 {
-			return nil, false, nil, parseError(msgUserAuthRequest)
+			return nil, false, nil, "", parseError(msgUserAuthRequest)
 		}
 	}
 
-	return publicKey, isQuery, sig, nil
+	return publicKey, isQuery, sig, algo, nil
 }
 
 func piping(dst, src packetConn) error {
@@ -476,13 +475,14 @@ func NewUpstreamConn(c net.Conn, config *ClientConfig) (*connection, error) {
 
 	if err := conn.clientHandshakeWithNoAuth(c.RemoteAddr().String(), &fullConf); err != nil {
 		c.Close()
-		return nil, err
+		return nil, fmt.Errorf("ssh: handshake failed: %v", err)
 	}
 
 	return conn, nil
 }
 
 func (c *connection) sendAuthReq() error {
+	// initiate user auth session
 	if err := c.transport.writePacket(Marshal(&serviceRequestMsg{serviceUserAuth})); err != nil {
 		return err
 	}
@@ -491,6 +491,35 @@ func (c *connection) sendAuthReq() error {
 	if err != nil {
 		return err
 	}
+
+	// The server may choose to send a SSH_MSG_EXT_INFO at this point (if we
+	// advertised willingness to receive one, which we always do) or not. See
+	// RFC 8308, Section 2.4.
+	extensions := make(map[string][]byte)
+	if len(packet) > 0 && packet[0] == msgExtInfo {
+		var extInfo extInfoMsg
+		if err := Unmarshal(packet, &extInfo); err != nil {
+			return err
+		}
+		payload := extInfo.Payload
+		for i := uint32(0); i < extInfo.NumExtensions; i++ {
+			name, rest, ok := parseString(payload)
+			if !ok {
+				return parseError(msgExtInfo)
+			}
+			value, rest, ok := parseString(rest)
+			if !ok {
+				return parseError(msgExtInfo)
+			}
+			extensions[string(name)] = value
+			payload = rest
+		}
+		packet, err = c.transport.readPacket()
+		if err != nil {
+			return err
+		}
+	}
+
 	var serviceAccept serviceAcceptMsg
 	return Unmarshal(packet, &serviceAccept)
 }
