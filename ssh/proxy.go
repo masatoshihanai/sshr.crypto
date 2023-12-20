@@ -452,6 +452,17 @@ func NewDownstreamConn(c net.Conn, config *ServerConfig) (*connection, error) {
 	fullConf := *config
 	fullConf.SetDefaults()
 
+	if len(fullConf.PublicKeyAuthAlgorithms) == 0 {
+		fullConf.PublicKeyAuthAlgorithms = supportedPubKeyAuthAlgos
+	} else {
+		for _, algo := range fullConf.PublicKeyAuthAlgorithms {
+			if !contains(supportedPubKeyAuthAlgos, algo) {
+				c.Close()
+				return nil, fmt.Errorf("ssh: unsupported public key authentication algorithm %s", algo)
+			}
+		}
+	}
+
 	conn := &connection{
 		sshConn: sshConn{conn: c},
 	}
