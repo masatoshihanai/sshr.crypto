@@ -21,3 +21,5 @@ subject line, so it is easy to find.
 Note that contributions to the cryptography package receive additional scrutiny
 due to their sensitive nature. Patches may take longer than normal to receive
 feedback.
+
+Modified by Masahaani
